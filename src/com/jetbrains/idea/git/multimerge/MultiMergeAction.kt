@@ -243,11 +243,11 @@ class MultiMergeAction : DumbAwareAction() {
     val ok = builder.showAndGet()
 
     return if (ok) {
-      properties.setValue("git.multimerge.make", make.isSelected)
+      properties.setValue("git.multimerge.make", make.isSelected, true)
       properties.setValue("git.multimerge.branches", branchChooser.text)
-      properties.setValue("git.multimerge.quit", quit.isSelected)
-      properties.setValue("git.multimerge.rollback", rollback.isSelected)
-      properties.setValue("git.multimerge.rollback.delete", deleteTempBranch.isSelected)
+      properties.setValue("git.multimerge.quit", quit.isSelected, true)
+      properties.setValue("git.multimerge.rollback", rollback.isSelected, true)
+      properties.setValue("git.multimerge.rollback.delete", deleteTempBranch.isSelected, true)
       Properties(branchChooser.text.split('\n').map { it.trim() },
               make.isSelected, quit.isSelected, rollback.isSelected, deleteTempBranch.isSelected)
     } else null;
