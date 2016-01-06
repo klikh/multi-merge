@@ -117,10 +117,11 @@ class MultiMergeAction : DumbAwareAction() {
   }
 
   private fun findTempBranchName(repositories: Collection<GitRepository>): String {
-    var name = "multi-merge"
+    val baseName = "multi-merge"
+    var name = baseName
     var step = 1;
     while (repositories.find { it.branches.findBranchByName(name) != null } != null) {
-      name += step.toString()
+      name = baseName + step.toString()
       step++
     }
     return name
