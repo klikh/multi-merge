@@ -37,8 +37,6 @@ import javax.swing.border.CompoundBorder
 
 class MultiMergeAction : DumbAwareAction() {
 
-  private val SKIP = GitCommandResult(false, 2, emptyList(), emptyList(), null)
-
   override fun update(e: AnActionEvent) {
     super.update(e)
     e.presentation.isEnabledAndVisible = e.project != null
@@ -132,23 +130,26 @@ class MultiMergeAction : DumbAwareAction() {
     val successful = arrayListOf<GitRepository>();
     val skipped = arrayListOf<GitRepository>();
     for (repository in GitUtil.getRepositoryManager(project).repositories) {
-      val res = merge(branches, repository)
-      if (res == SKIP) {
+      val existingBranches = branches.filter{repository.branches.findBranchByName(it) != null}
+      if (existingBranches.isEmpty()) {
         skipped.add(repository)
       }
-      else if (!res.success()) {
-        var choice = -1
-        ApplicationManager.getApplication().invokeAndWait({
-          choice = Messages.showYesNoDialog(project, res.errorOutputAsJoinedString + "\n\nDo you want to undo?",
-                  "Merge Failed", "Undo", "Do nothing", Messages.getErrorIcon())
-        }, ModalityState.defaultModalityState())
-        if (choice == Messages.YES) {
-          undo(project, repository, successful, originalBranches, tempBranchName)
-        }
-        return false;
-      }
       else {
-        successful.add(repository)
+        val res = merge(branches, repository)
+        if (!res.success()) {
+          var choice = -1
+          ApplicationManager.getApplication().invokeAndWait({
+            choice = Messages.showYesNoDialog(project, res.errorOutputAsJoinedString + "\n\nDo you want to undo?",
+                    "Merge Failed", "Undo", "Do nothing", Messages.getErrorIcon())
+          }, ModalityState.defaultModalityState())
+          if (choice == Messages.YES) {
+            undo(project, repository, successful, originalBranches, tempBranchName)
+          }
+          return false;
+        }
+        else {
+          successful.add(repository)
+        }
       }
     }
     val notifier = VcsNotifier.getInstance(project)
@@ -199,11 +200,8 @@ class MultiMergeAction : DumbAwareAction() {
     val git = ServiceManager.getService(Git::class.java)
     val handler = GitLineHandler(repository.project, repository.root, GitCommand.MERGE)
     handler.addParameters(branches)
-    val unknownPathspec = GitSimpleEventDetector(GitSimpleEventDetector.Event.INVALID_REFERENCE)
-    handler.addLineListener(unknownPathspec)
     val result = git.runCommand(handler)
     VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
-    if (unknownPathspec.hasHappened()) return SKIP
     return result
   }
 
