@@ -30,13 +30,14 @@ import com.intellij.util.ui.JBUI
 import git4idea.GitUtil
 import git4idea.commands.*
 import git4idea.repo.GitRepository
-import git4idea.reset.GitResetMode
 import java.awt.BorderLayout
 import java.awt.Dimension
 import javax.swing.BorderFactory
 import javax.swing.border.CompoundBorder
 
 class MultiMergeAction : DumbAwareAction() {
+
+  private val SKIP = GitCommandResult(false, 2, emptyList(), emptyList(), null)
 
   override fun update(e: AnActionEvent) {
     super.update(e)
@@ -53,8 +54,18 @@ class MultiMergeAction : DumbAwareAction() {
     val props = showDialog(project, branches)
     if (props != null) {
       var success = false
+      val tempBranchName = findTempBranchName(GitUtil.getRepositoryManager(project).repositories)
+      val originalBranches = recordOriginalBranches(GitUtil.getRepositoryManager(project).repositories)
       ProgressManager.getInstance().runProcessWithProgressSynchronously({
-        success = merge(project, props.branches)
+        try {
+          success = checkoutTempBranch(project, tempBranchName, originalBranches)
+          if (success) {
+            success = merge(project, props.branches, originalBranches, tempBranchName)
+          }
+        } catch(e: Throwable) {
+          success = false
+          throw e
+        }
       }, "Merging...", true, project)
       if (success && props.make) {
         CompilerManager.getInstance(project).make{ aborted, errors, warnings, context ->
@@ -66,12 +77,52 @@ class MultiMergeAction : DumbAwareAction() {
     }
   }
 
-  private fun merge(project: Project, branches: List<String>): Boolean {
+  private fun recordOriginalBranches(repositories: List<GitRepository>): Map<GitRepository, String> {
+    return repositories.toMap { Pair(it, it.currentBranchName!!) }
+  }
+
+  private fun checkoutTempBranch(project: Project, tempBranchName: String, originalBranches: Map<GitRepository, String>): Boolean {
+    val successful = arrayListOf<GitRepository>();
+    val git = ServiceManager.getService(Git::class.java)
+    GitUtil.getRepositoryManager(project).repositories.forEach {
+      val res = git.checkoutNewBranch(it, tempBranchName, null);
+      if (!res.success()) {
+        if (!successful.isEmpty()) {
+          var choice = -1
+          ApplicationManager.getApplication().invokeAndWait({
+            choice = Messages.showYesNoDialog(project, res.errorOutputAsJoinedString + "\n\nDo you want to undo?",
+                    "Checkout Failed", "Undo", "Do nothing", Messages.getErrorIcon())
+          }, ModalityState.defaultModalityState())
+          if (choice == Messages.YES) {
+            undoCheckout(project, successful, originalBranches, tempBranchName)
+          }
+        }
+        return false;
+      }
+      else {
+        successful.add(it)
+      }
+    }
+    return true;
+  }
+
+  private fun findTempBranchName(repositories: Collection<GitRepository>): String {
+    var name = "multi-merge"
+    var step = 1;
+    while (repositories.find { it.branches.findBranchByName(name) != null } != null) {
+      name += step.toString()
+      step++
+    }
+    return name
+  }
+
+  private fun merge(project: Project, branches: List<String>,
+                    originalBranches: Map<GitRepository, String>, tempBranchName: String): Boolean {
     val successful = arrayListOf<GitRepository>();
     val skipped = arrayListOf<GitRepository>();
     for (repository in GitUtil.getRepositoryManager(project).repositories) {
       val res = merge(branches, repository)
-      if (res == SKIP_RESULT) {
+      if (res == SKIP) {
         skipped.add(repository)
       }
       else if (!res.success()) {
@@ -81,7 +132,7 @@ class MultiMergeAction : DumbAwareAction() {
                   "Merge Failed", "Undo", "Do nothing", Messages.getErrorIcon())
         }, ModalityState.defaultModalityState())
         if (choice == Messages.YES) {
-          undo(repository, successful)
+          undo(project, repository, successful, originalBranches, tempBranchName)
         }
         return false;
       }
@@ -99,17 +150,32 @@ class MultiMergeAction : DumbAwareAction() {
     return true;
   }
 
-  private fun undo(repository: GitRepository, successful: Collection<GitRepository>) {
+  private fun undo(project: Project, repository: GitRepository, successful: Collection<GitRepository>,
+                   originalBranches: Map<GitRepository, String>, tempBranchName: String) {
     val git = ServiceManager.getService(Git::class.java)
-    val result = GitCompoundResult(repository.project)
-    result.append(repository, git.resetMerge(repository, null))
-    for (repo in successful) {
-      result.append(repo, git.reset(repo, GitResetMode.HARD, "HEAD^"))
-      VfsUtil.markDirtyAndRefresh(false, true, false, repo.root)
+    val resetMergeResult = git.resetMerge(repository, null)
+    if (!resetMergeResult.success()) {
+      VcsNotifier.getInstance(repository.project).notifyError("Rollback Failed", resetMergeResult.errorOutputAsHtmlString)
     }
-    val notifier = VcsNotifier.getInstance(repository.project)
+    VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
+
+    undoCheckout(project, successful, originalBranches, tempBranchName)
+  }
+
+  private fun undoCheckout(project: Project, successful: Collection<GitRepository>,
+                           originalBranches: Map<GitRepository, String>, tempBranchName: String) {
+    val git = ServiceManager.getService(Git::class.java)
+    val result = GitCompoundResult(project)
+    successful.forEach {
+      val checkoutRes = git.checkout(it, originalBranches[it]!!, null, true, false)
+      result.append(it, checkoutRes)
+      if (checkoutRes.success()) {
+        result.append(it, git.branchDelete(it, tempBranchName, true))
+      }
+    }
+    val notifier = VcsNotifier.getInstance(project)
     if (result.totalSuccess()) {
-      notifier.notifySuccess("Rolled Back the merge")
+      notifier.notifySuccess("Rolled back the checkout")
     }
     else {
       notifier.notifyError("Rollback Failed", result.errorOutputWithReposIndication)
@@ -124,11 +190,9 @@ class MultiMergeAction : DumbAwareAction() {
     handler.addLineListener(unknownPathspec)
     val result = git.runCommand(handler)
     VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
-    if (unknownPathspec.hasHappened()) return SKIP_RESULT
+    if (unknownPathspec.hasHappened()) return SKIP
     return result
   }
-
-  val SKIP_RESULT = GitCommandResult(true, 1, emptyList(), emptyList(), null)
 
   private fun quit() {
     (ApplicationManager.getApplication() as ApplicationImpl).exit(false, false, false, false)
@@ -137,7 +201,8 @@ class MultiMergeAction : DumbAwareAction() {
   private fun showDialog(project: Project, branches: Set<String>): Properties? {
     val properties = PropertiesComponent.getInstance()
     val msg = "Choose branches to merge?"
-    val branchChooser = createTextField(project, branches, properties.getValue("git.multimerge.branches", "").split('\n'))
+    val savedBranches = properties.getValue("git.multimerge.branches", "").split('\n').map{it.trim()}
+    val branchChooser = createTextField(project, branches, savedBranches)
     val make = JBCheckBox("Make after merge?", properties.getBoolean("git.multimerge.make", true))
     val quit = JBCheckBox("Quit after make?", properties.getBoolean("git.multimerge.quit", true))
 
@@ -156,7 +221,7 @@ class MultiMergeAction : DumbAwareAction() {
       properties.setValue("git.multimerge.make", make.isSelected)
       properties.setValue("git.multimerge.branches", branchChooser.text)
       properties.setValue("git.multimerge.quit", quit.isSelected)
-      Properties(branchChooser.text.split('\n'), make.isSelected, quit.isSelected)
+      Properties(branchChooser.text.split('\n').map{it.trim()}, make.isSelected, quit.isSelected)
     } else null;
   }
 
