@@ -47,15 +47,16 @@ class MultiMergeAction : DumbAwareAction() {
   override fun actionPerformed(event: AnActionEvent) {
     val project = event.project!!
     val branches = hashSetOf<String>()
-    GitUtil.getRepositoryManager(project).repositories.forEach {
+    val repositories = GitUtil.getRepositoryManager(project).repositories
+    repositories.forEach {
       branches.addAll(it.branches.localBranches.map {it.name})
       branches.addAll(it.branches.remoteBranches.map {it.name})
     }
     val props = showDialog(project, branches)
     if (props != null) {
       var success = false
-      val tempBranchName = findTempBranchName(GitUtil.getRepositoryManager(project).repositories)
-      val originalBranches = recordOriginalBranches(GitUtil.getRepositoryManager(project).repositories)
+      val tempBranchName = findTempBranchName(repositories)
+      val originalBranches = recordOriginalBranches(repositories)
       ProgressManager.getInstance().runProcessWithProgressSynchronously({
         try {
           success = checkoutTempBranch(project, tempBranchName, originalBranches)
@@ -69,8 +70,17 @@ class MultiMergeAction : DumbAwareAction() {
       }, "Merging...", true, project)
       if (success && props.make) {
         CompilerManager.getInstance(project).make{ aborted, errors, warnings, context ->
-          if (!aborted && errors == 0 && props.quit) {
-            quit()
+          if (!aborted && errors == 0) {
+
+            if (props.checkoutBack) {
+              ProgressManager.getInstance().runProcessWithProgressSynchronously({
+                undoCheckout(project, repositories, originalBranches, tempBranchName, props.deleteTempBranch)
+              }, "Checking out original branches...", true, project)
+            }
+
+            if (props.quit) {
+              quit()
+            }
           }
         }
       }
@@ -94,7 +104,7 @@ class MultiMergeAction : DumbAwareAction() {
                     "Checkout Failed", "Undo", "Do nothing", Messages.getErrorIcon())
           }, ModalityState.defaultModalityState())
           if (choice == Messages.YES) {
-            undoCheckout(project, successful, originalBranches, tempBranchName)
+            undoCheckout(project, successful, originalBranches, tempBranchName, true)
           }
         }
         return false;
@@ -159,19 +169,21 @@ class MultiMergeAction : DumbAwareAction() {
     }
     VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
 
-    undoCheckout(project, successful, originalBranches, tempBranchName)
+    undoCheckout(project, successful, originalBranches, tempBranchName, true)
   }
 
   private fun undoCheckout(project: Project, successful: Collection<GitRepository>,
-                           originalBranches: Map<GitRepository, String>, tempBranchName: String) {
+                           originalBranches: Map<GitRepository, String>, tempBranchName: String,
+                           deleteTempBranch: Boolean) {
     val git = ServiceManager.getService(Git::class.java)
     val result = GitCompoundResult(project)
     successful.forEach {
       val checkoutRes = git.checkout(it, originalBranches[it]!!, null, true, false)
       result.append(it, checkoutRes)
-      if (checkoutRes.success()) {
+      if (deleteTempBranch && checkoutRes.success()) {
         result.append(it, git.branchDelete(it, tempBranchName, true))
       }
+      VfsUtil.markDirtyAndRefresh(false, true, false, it.root)
     }
     val notifier = VcsNotifier.getInstance(project)
     if (result.totalSuccess()) {
@@ -200,18 +212,31 @@ class MultiMergeAction : DumbAwareAction() {
 
   private fun showDialog(project: Project, branches: Set<String>): Properties? {
     val properties = PropertiesComponent.getInstance()
-    val msg = "Choose branches to merge?"
+    val msg = "Choose branches to merge"
     val savedBranches = properties.getValue("git.multimerge.branches", "").split('\n').map{it.trim()}
     val branchChooser = createTextField(project, branches, savedBranches)
-    val make = JBCheckBox("Make after merge?", properties.getBoolean("git.multimerge.make", true))
-    val quit = JBCheckBox("Quit after make?", properties.getBoolean("git.multimerge.quit", true))
+    val make = JBCheckBox("Make after merge", properties.getBoolean("git.multimerge.make", true))
+    val rollback = JBCheckBox("Rollback after make", properties.getBoolean("git.multimerge.rollback", true))
+    rollback.toolTipText = "Checkout the original branch and delete the temporary branch.\n" +
+            "Not that if you won't exit immediately, and if you have 'compile project automatically' enabled," +
+            "the build information will be overridden by original branch";
+    val deleteTempBranch = JBCheckBox("Delete temporary branch", properties.getBoolean("git.multimerge.rollback.delete", true))
+    val quit = JBCheckBox("Quit after make", properties.getBoolean("git.multimerge.quit", true))
+
+
+    val options1 = JBUI.Panels.simplePanel()
+    options1.add(make, BorderLayout.WEST)
+    options1.add(quit, BorderLayout.CENTER)
+    val options2 = JBUI.Panels.simplePanel()
+    options2.add(rollback, BorderLayout.WEST)
+    options2.add(deleteTempBranch, BorderLayout.CENTER)
+    val options = JBUI.Panels.simplePanel()
+    options.add(options1, BorderLayout.NORTH)
+    options.add(options2, BorderLayout.CENTER)
 
     val panel = JBUI.Panels.simplePanel();
     panel.add(JBLabel(msg), BorderLayout.NORTH)
     panel.add(branchChooser)
-    val options = JBUI.Panels.simplePanel()
-    options.add(make, BorderLayout.WEST)
-    options.add(quit, BorderLayout.CENTER)
     panel.add(options, BorderLayout.SOUTH)
     val builder = DialogBuilder().centerPanel(panel).title("Git Fetch Duration Test")
     builder.setPreferredFocusComponent(branchChooser)
@@ -221,7 +246,10 @@ class MultiMergeAction : DumbAwareAction() {
       properties.setValue("git.multimerge.make", make.isSelected)
       properties.setValue("git.multimerge.branches", branchChooser.text)
       properties.setValue("git.multimerge.quit", quit.isSelected)
-      Properties(branchChooser.text.split('\n').map{it.trim()}, make.isSelected, quit.isSelected)
+      properties.setValue("git.multimerge.rollback", rollback.isSelected)
+      properties.setValue("git.multimerge.rollback.delete", deleteTempBranch.isSelected)
+      Properties(branchChooser.text.split('\n').map { it.trim() },
+              make.isSelected, quit.isSelected, rollback.isSelected, deleteTempBranch.isSelected)
     } else null;
   }
 
@@ -233,12 +261,12 @@ class MultiMergeAction : DumbAwareAction() {
     textField.border = CompoundBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2), textField.border)
     textField.setOneLineMode(false)
     textField.minimumSize = Dimension(200, 200)
-    textField.text = initialValues.joinToString("\n")
-    MyCompletionProvider(values, false).apply(textField)
+    MyCompletionProvider(values, false).apply(textField, initialValues.joinToString("\n"))
     return textField
   }
 
-  private data class Properties(val branches: List<String>, val make: Boolean, val quit: Boolean)
+  private data class Properties(val branches: List<String>, val make: Boolean, val quit: Boolean,
+                                val checkoutBack: Boolean, val deleteTempBranch: Boolean)
 
   private class MyCompletionProvider internal constructor(private val myValues: Collection<String>, private val mySupportsNegativeValues: Boolean) : TextFieldCompletionProviderDumbAware(true) {
 
