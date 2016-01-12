@@ -4,20 +4,15 @@ import com.intellij.codeInsight.completion.CompletionResultSet
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.impl.ApplicationImpl
-import com.intellij.openapi.compiler.CompilerManager
 import com.intellij.openapi.components.ServiceManager
 import com.intellij.openapi.editor.SpellCheckingEditorCustomizationProvider
 import com.intellij.openapi.fileTypes.FileTypes
+import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogBuilder
-import com.intellij.openapi.ui.Messages
-import com.intellij.openapi.vcs.VcsNotifier
-import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.ui.EditorCustomization
 import com.intellij.ui.EditorTextField
 import com.intellij.ui.EditorTextFieldProvider
@@ -28,7 +23,6 @@ import com.intellij.util.TextFieldCompletionProviderDumbAware
 import com.intellij.util.containers.ContainerUtil
 import com.intellij.util.ui.JBUI
 import git4idea.GitUtil
-import git4idea.commands.*
 import git4idea.repo.GitRepository
 import java.awt.BorderLayout
 import java.awt.Dimension
@@ -47,71 +41,25 @@ class MultiMergeAction : DumbAwareAction() {
     val branches = hashSetOf<String>()
     val repositories = GitUtil.getRepositoryManager(project).repositories
     repositories.forEach {
-      branches.addAll(it.branches.localBranches.map {it.name})
-      branches.addAll(it.branches.remoteBranches.map {it.name})
+      branches.addAll(it.branches.localBranches.map { it.name })
+      branches.addAll(it.branches.remoteBranches.map { it.name })
     }
     val props = showDialog(project, branches)
     if (props != null) {
-      var success = false
       val tempBranchName = findTempBranchName(repositories)
       val originalBranches = recordOriginalBranches(repositories)
-      ProgressManager.getInstance().runProcessWithProgressSynchronously({
-        try {
-          success = checkoutTempBranch(project, tempBranchName, originalBranches)
-          if (success) {
-            success = merge(project, props.branches, originalBranches, tempBranchName)
-          }
-        } catch(e: Throwable) {
-          success = false
-          throw e
-        }
-      }, "Merging...", true, project)
-      if (success && props.make) {
-        CompilerManager.getInstance(project).make{ aborted, errors, warnings, context ->
-          if (!aborted && errors == 0) {
 
-            if (props.checkoutBack) {
-              ProgressManager.getInstance().runProcessWithProgressSynchronously({
-                undoCheckout(project, repositories, originalBranches, tempBranchName, props.deleteTempBranch)
-              }, "Checking out original branches...", true, project)
-            }
-
-            if (props.quit) {
-              quit()
-            }
-          }
+      val multiMerger = MultiMerger(project, repositories, tempBranchName, originalBranches, props)
+      ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Performing Multi Merge...") {
+        override fun run(pi: ProgressIndicator) {
+          multiMerger.run(pi)
         }
-      }
+      })
     }
   }
 
   private fun recordOriginalBranches(repositories: List<GitRepository>): Map<GitRepository, String> {
     return repositories.toMap { Pair(it, it.currentBranchName!!) }
-  }
-
-  private fun checkoutTempBranch(project: Project, tempBranchName: String, originalBranches: Map<GitRepository, String>): Boolean {
-    val successful = arrayListOf<GitRepository>();
-    val git = ServiceManager.getService(Git::class.java)
-    GitUtil.getRepositoryManager(project).repositories.forEach {
-      val res = git.checkoutNewBranch(it, tempBranchName, null);
-      if (!res.success()) {
-        if (!successful.isEmpty()) {
-          var choice = -1
-          ApplicationManager.getApplication().invokeAndWait({
-            choice = Messages.showYesNoDialog(project, res.errorOutputAsJoinedString + "\n\nDo you want to undo?",
-                    "Checkout Failed", "Undo", "Do nothing", Messages.getErrorIcon())
-          }, ModalityState.defaultModalityState())
-          if (choice == Messages.YES) {
-            undoCheckout(project, successful, originalBranches, tempBranchName, true)
-          }
-        }
-        return false;
-      }
-      else {
-        successful.add(it)
-      }
-    }
-    return true;
   }
 
   private fun findTempBranchName(repositories: Collection<GitRepository>): String {
@@ -125,94 +73,11 @@ class MultiMergeAction : DumbAwareAction() {
     return name
   }
 
-  private fun merge(project: Project, branches: List<String>,
-                    originalBranches: Map<GitRepository, String>, tempBranchName: String): Boolean {
-    val successful = arrayListOf<GitRepository>();
-    val skipped = arrayListOf<GitRepository>();
-    for (repository in GitUtil.getRepositoryManager(project).repositories) {
-      val existingBranches = branches.filter{repository.branches.findBranchByName(it) != null}
-      if (existingBranches.isEmpty()) {
-        skipped.add(repository)
-      }
-      else {
-        val res = merge(branches, repository)
-        if (!res.success()) {
-          var choice = -1
-          ApplicationManager.getApplication().invokeAndWait({
-            choice = Messages.showYesNoDialog(project, res.errorOutputAsJoinedString + "\n\nDo you want to undo?",
-                    "Merge Failed", "Undo", "Do nothing", Messages.getErrorIcon())
-          }, ModalityState.defaultModalityState())
-          if (choice == Messages.YES) {
-            undo(project, repository, successful, originalBranches, tempBranchName)
-          }
-          return false;
-        }
-        else {
-          successful.add(repository)
-        }
-      }
-    }
-    val notifier = VcsNotifier.getInstance(project)
-    if (skipped.isEmpty()) {
-      notifier.notifySuccess("Merged successfully")
-    }
-    else {
-      notifier.notifySuccess("Merged successfully", "Skipped " + skipped.joinToString("\n", transform = {it.root.name}))
-    }
-    return true;
-  }
-
-  private fun undo(project: Project, repository: GitRepository, successful: Collection<GitRepository>,
-                   originalBranches: Map<GitRepository, String>, tempBranchName: String) {
-    val git = ServiceManager.getService(Git::class.java)
-    val resetMergeResult = git.resetMerge(repository, null)
-    if (!resetMergeResult.success()) {
-      VcsNotifier.getInstance(repository.project).notifyError("Rollback Failed", resetMergeResult.errorOutputAsHtmlString)
-    }
-    VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
-
-    undoCheckout(project, successful, originalBranches, tempBranchName, true)
-  }
-
-  private fun undoCheckout(project: Project, successful: Collection<GitRepository>,
-                           originalBranches: Map<GitRepository, String>, tempBranchName: String,
-                           deleteTempBranch: Boolean) {
-    val git = ServiceManager.getService(Git::class.java)
-    val result = GitCompoundResult(project)
-    successful.forEach {
-      val checkoutRes = git.checkout(it, originalBranches[it]!!, null, true, false)
-      result.append(it, checkoutRes)
-      if (deleteTempBranch && checkoutRes.success()) {
-        result.append(it, git.branchDelete(it, tempBranchName, true))
-      }
-      VfsUtil.markDirtyAndRefresh(false, true, false, it.root)
-    }
-    val notifier = VcsNotifier.getInstance(project)
-    if (result.totalSuccess()) {
-      notifier.notifySuccess("Rolled back the checkout")
-    }
-    else {
-      notifier.notifyError("Rollback Failed", result.errorOutputWithReposIndication)
-    }
-  }
-
-  private fun merge(branches: List<String>, repository: GitRepository): GitCommandResult {
-    val git = ServiceManager.getService(Git::class.java)
-    val handler = GitLineHandler(repository.project, repository.root, GitCommand.MERGE)
-    handler.addParameters(branches)
-    val result = git.runCommand(handler)
-    VfsUtil.markDirtyAndRefresh(false, true, false, repository.root)
-    return result
-  }
-
-  private fun quit() {
-    (ApplicationManager.getApplication() as ApplicationImpl).exit(false, false, false, false)
-  }
-
   private fun showDialog(project: Project, branches: Set<String>): Properties? {
     val properties = PropertiesComponent.getInstance()
     val msg = "Choose branches to merge"
-    val savedBranches = properties.getValue("git.multimerge.branches", "").split('\n').map{it.trim()}
+    var savedBranches = properties.getValue("git.multimerge.branches", "").split('\n').map { it.trim() }
+    if (savedBranches.isEmpty()) savedBranches = listOf("master")
     val branchChooser = createTextField(project, branches, savedBranches)
     val make = JBCheckBox("Make after merge", properties.getBoolean("git.multimerge.make", true))
     val rollback = JBCheckBox("Rollback after make", properties.getBoolean("git.multimerge.rollback", true))
@@ -264,37 +129,34 @@ class MultiMergeAction : DumbAwareAction() {
     return textField
   }
 
-  private data class Properties(val branches: List<String>, val make: Boolean, val quit: Boolean,
-                                val checkoutBack: Boolean, val deleteTempBranch: Boolean)
-
   private class MyCompletionProvider internal constructor(private val myValues: Collection<String>, private val mySupportsNegativeValues: Boolean) : TextFieldCompletionProviderDumbAware(true) {
 
-      override fun getPrefix(currentTextPrefix: String): String {
-        val separatorPosition = lastSeparatorPosition(currentTextPrefix)
-        val prefix = if (separatorPosition == -1) currentTextPrefix else currentTextPrefix.substring(separatorPosition + 1).trim { it <= ' ' }
-        return if (mySupportsNegativeValues && prefix.startsWith("-")) prefix.substring(1) else prefix
-      }
+    override fun getPrefix(currentTextPrefix: String): String {
+      val separatorPosition = lastSeparatorPosition(currentTextPrefix)
+      val prefix = if (separatorPosition == -1) currentTextPrefix else currentTextPrefix.substring(separatorPosition + 1).trim { it <= ' ' }
+      return if (mySupportsNegativeValues && prefix.startsWith("-")) prefix.substring(1) else prefix
+    }
 
-      private fun lastSeparatorPosition(text: String): Int {
-        var lastPosition = -1
-        for (separator in listOf('\n')) {
-          val lio = text.lastIndexOf(separator)
-          if (lio > lastPosition) {
-            lastPosition = lio
-          }
+    private fun lastSeparatorPosition(text: String): Int {
+      var lastPosition = -1
+      for (separator in listOf('\n')) {
+        val lio = text.lastIndexOf(separator)
+        if (lio > lastPosition) {
+          lastPosition = lio
         }
-        return lastPosition
       }
+      return lastPosition
+    }
 
-      @SuppressWarnings("StringToUpperCaseOrToLowerCaseWithoutLocale")
-      override fun addCompletionVariants(text: String, offset: Int, prefix: String,
-                                         result: CompletionResultSet) {
-        result.addLookupAdvertisement("Select one or more users separated with comma, | or new lines")
-        for (completionVariant in myValues) {
-          val element = LookupElementBuilder.create(completionVariant)
-          result.addElement(element.withLookupString(completionVariant.toLowerCase()))
-        }
+    @SuppressWarnings("StringToUpperCaseOrToLowerCaseWithoutLocale")
+    override fun addCompletionVariants(text: String, offset: Int, prefix: String,
+                                       result: CompletionResultSet) {
+      result.addLookupAdvertisement("Select one or more users separated with comma, | or new lines")
+      for (completionVariant in myValues) {
+        val element = LookupElementBuilder.create(completionVariant)
+        result.addElement(element.withLookupString(completionVariant.toLowerCase()))
       }
     }
+  }
 }
 
